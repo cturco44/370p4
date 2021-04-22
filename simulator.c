@@ -19,6 +19,7 @@ typedef struct blockStruct {
     bool isDirty;
     bool isValid;
     int lruLabel;
+    int set;
     int tag;
 } blockStruct;
 
@@ -54,7 +55,7 @@ void printState(stateType *);
 int convertNum(int);
 int extractBits(int num, int position, int num_bits);
 int extract_opcode(int num);
-void process_opcode(stateType *statePtr, int opcode);
+void process_opcode(stateType *statePtr, int opcode, int loaded);
 void printAction(int address, int size, enum actionType type);
 int log2_int(int num_in);
 int load(int addr, stateType *statePtr);
@@ -62,7 +63,8 @@ void store(int addr, int data, stateType *statePtr);
 void updateLRU(int start, int end, int idx);
 int mask_last_n_bits(int n, int num);
 void copy_to_cache(int cache_idx, int addr, stateType *statePtr);
-int find_and_evict(int start, int end, int addr, stateType *statePtr);
+int find_and_evict(int start, int end, stateType *statePtr);
+int concatenate(int idx);
 
 int
 main(int argc, char *argv[])
@@ -85,11 +87,16 @@ main(int argc, char *argv[])
     cache.blockSize = atoi(argv[2]);
     cache.numSets = atoi(argv[3]);
     cache.blocksPerSet = atoi(argv[4]);
-    cache.blockBits = log2_int(cache.blocksPerSet);
+    cache.blockBits = log2_int(cache.blockSize);
     cache.setBits = log2_int(cache.numSets);
     
-    for(int i = 0; i < cache.numSets * cache.blocksPerSet; ++i) {
-        cache.blocks[i].isValid = false;
+    int idx = 0;
+    for(int i = 0; i < cache.numSets; ++i) {
+        for(int j = 0; j < cache.blocksPerSet; ++j) {
+            cache.blocks[idx].isValid = false;
+            cache.blocks[idx].set = i;
+            ++idx;
+        }
     }
     
     /* read the entire machine-code file into memory */
@@ -110,14 +117,15 @@ main(int argc, char *argv[])
     int num_instructions = 0;
     while(1) {
         printState(&state);
-        int opcode = extract_opcode(load(state.pc, &state));
+        int loaded = load(state.pc, &state);
+        int opcode = extract_opcode(loaded);
         if(opcode == 0b110) {
             printf("machine halted\n");
             ++state.pc;
             break;
         }
         else {
-            process_opcode(&state, opcode);
+            process_opcode(&state, opcode, loaded);
         }
         ++num_instructions;
     }
@@ -126,8 +134,8 @@ main(int argc, char *argv[])
     printState(&state);
     return(0);
 }
-void process_opcode(stateType *statePtr, int opcode) {
-    int num = statePtr->mem[statePtr->pc];
+void process_opcode(stateType *statePtr, int opcode, int loaded) {
+    int num = loaded;
     //add
     if(opcode == 0b000) {
         int destR = extractBits(num, 0, 3);
@@ -253,9 +261,9 @@ int log2_int(int num_in) {
 }
 int load(int addr, stateType *statePtr) {
     int block_offset = extractBits(addr, 0, cache.blockBits);
-    int set_index = extractBits(addr, cache.blockBits - 1, cache.setBits);
-    int tag_bit_start = cache.blockBits + cache.setBits - 1;
-    int num_tag_bits = 32 - cache.blockBits + cache.setBits;
+    int set_index = extractBits(addr, cache.blockBits, cache.setBits);
+    int tag_bit_start = cache.blockBits + cache.setBits;
+    int num_tag_bits = 32 - cache.blockBits - cache.setBits;
     int tag = extractBits(addr, tag_bit_start, num_tag_bits);
     
     int start = cache.blocksPerSet * set_index;
@@ -271,7 +279,7 @@ int load(int addr, stateType *statePtr) {
         }
     }
     
-    int replace = find_and_evict(start, end, addr, statePtr);
+    int replace = find_and_evict(start, end, statePtr);
     copy_to_cache(replace, addr, statePtr);
     updateLRU(start, end, replace);
     printAction(addr, 1, cacheToProcessor);
@@ -280,9 +288,9 @@ int load(int addr, stateType *statePtr) {
 }
 void store(int addr, int data, stateType *statePtr) {
     int block_offset = extractBits(addr, 0, cache.blockBits);
-    int set_index = extractBits(addr, cache.blockBits - 1, cache.setBits);
-    int tag_bit_start = cache.blockBits + cache.setBits - 1;
-    int num_tag_bits = 32 - cache.blockBits + cache.setBits;
+    int set_index = extractBits(addr, cache.blockBits, cache.setBits);
+    int tag_bit_start = cache.blockBits + cache.setBits;
+    int num_tag_bits = 32 - cache.blockBits - cache.setBits;
     int tag = extractBits(addr, tag_bit_start, num_tag_bits);
     
     int start = cache.blocksPerSet * set_index;
@@ -292,21 +300,23 @@ void store(int addr, int data, stateType *statePtr) {
     for(int i = start; i < end; ++i) {
         if(cache.blocks[i].isValid && cache.blocks[i].tag == tag) {
             cache.blocks[i].data[block_offset] = data;
+            cache.blocks[i].isDirty = true;
             printAction(addr, 1, processorToCache);
             return;
         }
     }
     
-    int replace = find_and_evict(start, end, addr, statePtr);
+    int replace = find_and_evict(start, end, statePtr);
     copy_to_cache(replace, addr, statePtr);
     updateLRU(start, end, replace);
     cache.blocks[replace].data[block_offset] = data;
+    cache.blocks[replace].isDirty = true;
     printAction(addr, 1, processorToCache);
 }
 // Does not update LRU
 void copy_to_cache(int cache_idx, int addr, stateType *statePtr) {
-    int tag_bit_start = cache.blockBits + cache.setBits - 1;
-    int num_tag_bits = 32 - cache.blockBits + cache.setBits;
+    int tag_bit_start = cache.blockBits + cache.setBits;
+    int num_tag_bits = 32 - cache.blockBits - cache.setBits;
     int tag = extractBits(addr, tag_bit_start, num_tag_bits);
     
     cache.blocks[cache_idx].isValid = true;
@@ -315,7 +325,7 @@ void copy_to_cache(int cache_idx, int addr, stateType *statePtr) {
     
     int address_start = mask_last_n_bits(cache.blockBits, addr);
     // Load block into memory
-    for(int j = 0; j < cache.blockBits; ++j) {
+    for(int j = 0; j < cache.blockSize; ++j) {
         cache.blocks[cache_idx].data[j] = statePtr->mem[address_start + j];
     }
     enum actionType processType;
@@ -342,7 +352,7 @@ int mask_last_n_bits(int n, int num) {
 }
 // Looks for open spot. If there is one, returns the index. If not, evicts LRU and returns new idx
 // Does not update LRU
-int find_and_evict(int start, int end, int addr, stateType *statePtr) {
+int find_and_evict(int start, int end, stateType *statePtr) {
     // Look for empty slot if not in cache
     for(int i = start; i < end; ++i) {
         //Found an empty slot
@@ -364,10 +374,10 @@ int find_and_evict(int start, int end, int addr, stateType *statePtr) {
     }
     
     
-    int address_start = mask_last_n_bits(cache.blockBits, addr);
+    int address_start = concatenate(max_idx);
     // If bit is not dirty
     if(!cache.blocks[max_idx].isDirty) {
-        printAction(addr, cache.blockSize, cacheToNowhere);
+        printAction(address_start, cache.blockSize, cacheToNowhere);
         return max_idx;
     }
     
@@ -379,4 +389,11 @@ int find_and_evict(int start, int end, int addr, stateType *statePtr) {
     }
     printAction(address_start, 4, cacheToMemory);
     return max_idx;
+}
+int concatenate(int idx) {
+    int tag = cache.blocks[idx].tag;
+    int result = (tag << cache.setBits) | cache.blocks[idx].set;
+    result = (result << cache.blockBits);
+    return result;
+    
 }
